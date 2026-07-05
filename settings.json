@@ -1,0 +1,7 @@
+{
+  "directory": "",
+  "auto_start": false,
+  "auto_update": false,
+  "start_args": "--disable=traefik --disable=servicelb",
+  "version": ""
+}

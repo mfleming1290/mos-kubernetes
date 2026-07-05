@@ -1,0 +1,172 @@
+#!/bin/bash
+
+# Import MOS functions
+. /usr/local/lib/functions/mos-common
+
+# Set HEADER if GitHub Token was specified
+GH_TOKEN=$(jq -r '.github // empty' /boot/config/system/tokens.json 2>/dev/null)
+if [ ! -z "$GH_TOKEN" ] ; then
+  TOKEN="$(decrypt_password "$GH_TOKEN" "tokens")"
+  HEADER=(--header "Authorization: Bearer $TOKEN")
+else
+  HEADER=()
+fi
+
+# Set Variables
+PLG_DIR="/boot/optional/plugins/kubernetes"
+INIT_SCRIPT="/etc/init.d/k3s"
+BIN_FILE="$PLG_DIR/bin/k3s"
+TARGET_BIN="/usr/bin/k3s"
+K3S_SYMLINKS="kubectl crictl ctr"
+
+# Function to deploy the k3s binary to /usr/bin and create symlinks
+deploy_binary() {
+  [ -f "$BIN_FILE" ] || return 1
+
+  cp -f "$BIN_FILE" "$TARGET_BIN"
+  chmod +x "$TARGET_BIN"
+
+  for link in $K3S_SYMLINKS; do
+    ln -sf "$TARGET_BIN" "/usr/bin/$link"
+  done
+}
+
+# Function to get latest version from k3s
+get_latest_version() {
+  local TAGS
+  local VERSION
+
+  TAGS=$(curl -s "${HEADER[@]}" "https://api.github.com/repos/k3s-io/k3s/releases/latest" 2>/dev/null)
+  VERSION=$(echo "$TAGS" | jq -r '.tag_name // empty' 2>/dev/null)
+
+  if [ -z "$VERSION" ]; then
+    VERSION=$(echo "$TAGS" | jq -r '.name // empty' 2>/dev/null)
+  fi
+
+  if [ -z "$VERSION" ]; then
+    echo "v0"
+  else
+    echo "$VERSION"
+  fi
+}
+
+# Function to get the version of the currently deployed binary
+get_installed_version() {
+  [ -x "$TARGET_BIN" ] || return 0
+  "$TARGET_BIN" --version 2>/dev/null | grep -oP 'v\d+\.\d+\.\d+\+k3s\d+' | head -n1
+}
+
+# Function to download k3s version, deploy it and record it in settings
+download_binary() {
+  local VERSION="$1"
+
+  if [ -z "$VERSION" ] || [ "$VERSION" = "v0" ]; then
+    echo "No valid version to download"
+    return 1
+  fi
+
+  mkdir -p "$PLG_DIR/bin"
+
+  local ARCHITECTURE
+  local BIN_SUFFIX
+  ARCHITECTURE=$(get_arch)
+  if [ "$ARCHITECTURE" = "arm64" ]; then
+    BIN_SUFFIX="-arm64"
+  else
+    BIN_SUFFIX=""
+  fi
+
+  local URL="https://github.com/k3s-io/k3s/releases/download/${VERSION//+/%2B}/k3s${BIN_SUFFIX}"
+
+  if wget -q "$URL" -O "$BIN_FILE"; then
+    if [ -f "$BIN_FILE" ] && [ -s "$BIN_FILE" ]; then
+      chmod +x "$BIN_FILE"
+      deploy_binary
+
+      jq ".version = \"$VERSION\"" "$PLG_DIR/settings.json" > "$PLG_DIR/settings.json.tmp"
+      mv "$PLG_DIR/settings.json.tmp" "$PLG_DIR/settings.json"
+
+      echo "Installed $VERSION"
+    else
+      rm -f "$BIN_FILE"
+      echo "Downloaded file is empty"
+      return 1
+    fi
+  else
+    rm -f "$BIN_FILE"
+    echo "Failed to download"
+    return 1
+  fi
+}
+
+case "$1" in
+  check_version)
+    CURRENT_VERSION=$(jq -r '.version // empty' "$PLG_DIR/settings.json" 2>/dev/null)
+    if [ -z "$CURRENT_VERSION" ]; then
+      CURRENT_VERSION="not installed"
+    fi
+
+    LATEST_VERSION=$(get_latest_version)
+
+    if [ "$CURRENT_VERSION" = "not installed" ] || [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+      echo "{\"current\":\"$CURRENT_VERSION\",\"latest\":\"$LATEST_VERSION\",\"update_available\":true}"
+    else
+      echo "{\"current\":\"$CURRENT_VERSION\",\"latest\":\"$LATEST_VERSION\",\"update_available\":false}"
+    fi
+  ;;
+
+  install_binary)
+    VERSION=$(get_latest_version)
+    download_binary "$VERSION" || exit 1
+  ;;
+
+  auto_update)
+    # Boot-time update check
+    INSTALLED=$(get_installed_version)
+    LATEST=$(get_latest_version)
+
+    if [ -n "$LATEST" ] && [ "$LATEST" != "v0" ] && [ "$INSTALLED" != "$LATEST" ]; then
+      echo "Updating k3s: $INSTALLED -> $LATEST"
+      download_binary "$LATEST" || exit 1
+    else
+      echo "k3s is up to date ($INSTALLED)"
+    fi
+  ;;
+
+  installed_version)
+    get_installed_version
+  ;;
+
+  deploy_binary)
+    deploy_binary
+  ;;
+
+  logs)
+    LOG_FILE="/var/log/k3s"
+    if [ -f "$LOG_FILE" ]; then
+      tail -n 300 "$LOG_FILE"
+    fi
+  ;;
+
+  start)
+    "$INIT_SCRIPT" start
+  ;;
+
+  stop)
+    "$INIT_SCRIPT" stop
+  ;;
+
+  restart)
+    "$INIT_SCRIPT" restart
+  ;;
+
+  status)
+    RUNNING="false"
+
+    if "$INIT_SCRIPT" status >/dev/null 2>&1; then
+      RUNNING="true"
+    fi
+
+    echo "{\"running\":$RUNNING}"
+  ;;
+esac

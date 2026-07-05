@@ -1,0 +1,264 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          k3s
+# Required-Start:    $local_fs $network $remote_fs
+# Required-Stop:     $local_fs $network $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: k3s lightweight Kubernetes (MOS plugin)
+# Description:       Starts and stops the k3s server managed by the MOS Kubernetes plugin.
+### END INIT INFO
+
+# Set Variables
+PLG_DIR="/boot/optional/plugins/kubernetes"
+SETTINGS_FILE="$PLG_DIR/settings.json"
+PID_FILE="/var/run/k3s.pid"
+LOG_FILE="/var/log/k3s"
+
+# Function to get installation directory
+get_directory() {
+  local DIRECTORY=""
+
+  if [ -f "$SETTINGS_FILE" ]; then
+    DIRECTORY=$(jq -r '.directory // empty' "$SETTINGS_FILE" 2>/dev/null)
+  fi
+
+  if [ -z "$DIRECTORY" ] || [ "$DIRECTORY" = "null" ]; then
+    return 1
+  fi
+
+  echo "$DIRECTORY"
+}
+
+# Function to get start arguments
+get_start_args() {
+  local START_ARGS=""
+
+  if [ -f "$SETTINGS_FILE" ]; then
+    START_ARGS=$(jq -r '.start_args // empty' "$SETTINGS_FILE" 2>/dev/null)
+  fi
+
+  if [ "$START_ARGS" = "null" ]; then
+    START_ARGS=""
+  fi
+
+  echo "$START_ARGS"
+}
+
+# Function to check if k3s is running
+is_running() {
+  if [ -f "$PID_FILE" ]; then
+    local PID
+    PID=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+start_k3s() {
+  if is_running; then
+    echo "k3s is already running (PID: $(cat "$PID_FILE"))"
+    return 0
+  fi
+  rm -f "$PID_FILE"
+
+  DIRECTORY=$(get_directory)
+  if [ -z "$DIRECTORY" ]; then
+    echo "Error: Cannot determine directory, not starting k3s"
+    return 1
+  fi
+
+  # Safety check if pool where k3s is on is mounted
+  if [ "${DIRECTORY#/mnt/}" != "$DIRECTORY" ]; then
+    if ! findmnt "$(echo "$DIRECTORY" | cut -d '/' -f 1-3)" >/dev/null 2>&1; then
+      echo "Error: Pool for $DIRECTORY is not mounted, not starting k3s"
+      return 1
+    fi
+  elif [ "${DIRECTORY#/var/mergerfs/}" != "$DIRECTORY" ]; then
+    if ! findmnt "$(echo "$DIRECTORY" | cut -d '/' -f 1-5)" >/dev/null 2>&1; then
+      echo "Error: Pool for $DIRECTORY is not mounted, not starting k3s"
+      return 1
+    fi
+  fi
+
+  [ ! -d "$DIRECTORY" ] && \
+    mkdir -p "$DIRECTORY"
+
+  # Make sure the k3s binary is available
+  if [ ! -x /usr/bin/k3s ]; then
+    /usr/bin/plugins/k3s deploy_binary 2>/dev/null
+  fi
+  if [ ! -x /usr/bin/k3s ]; then
+    echo "Error: k3s binary not installed, not starting k3s"
+    return 1
+  fi
+
+  START_ARGS=$(get_start_args)
+
+  mkdir -p "$DIRECTORY/data"
+
+  # Disable pivot_root in containerd
+  CONTAINERD_DIR="$DIRECTORY/data/agent/etc/containerd/config-v3.toml.d"
+  mkdir -p "$CONTAINERD_DIR"
+  cat > "$CONTAINERD_DIR/10-nopivot.toml" <<'EOF'
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
+  NoPivotRoot = true
+EOF
+
+  # kubelet root-dir on the system directory
+  mkdir -p "$DIRECTORY/kubelet"
+
+  # Bind-mount /etc/rancher into the system directory
+  [ ! -d "$DIRECTORY/rancher" ] && \
+    mkdir -p "$DIRECTORY/rancher"
+  [ ! -d /etc/rancher ] && \
+    mkdir -p /etc/rancher
+  if ! findmnt /etc/rancher >/dev/null 2>&1; then
+    mount --bind "$DIRECTORY/rancher" /etc/rancher
+  fi
+
+  # Expose kubeconfig for the helm plugin if installed
+  if [ -d /boot/optional/plugins/helm ]; then
+    mkdir -p /root/.kube
+    ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config
+  fi
+
+  nohup /usr/bin/k3s server \
+    --write-kubeconfig-mode 644 \
+    --data-dir "$DIRECTORY/data" \
+    --kubelet-arg=root-dir="$DIRECTORY/kubelet" \
+    $START_ARGS > "$LOG_FILE" 2>&1 &
+  NEWPID=$!
+  echo $NEWPID > "$PID_FILE"
+  sleep 1
+  if kill -0 "$NEWPID" 2>/dev/null; then
+    echo "k3s started (PID: $NEWPID)"
+  else
+    rm -f "$PID_FILE"
+    echo "Failed to start k3s, check $LOG_FILE"
+    return 1
+  fi
+}
+
+# Clean up containers, mounts and network (based on k3s-killall.sh)
+mos_killall() {
+  DIRECTORY=$(get_directory)
+  [ -z "$DIRECTORY" ] && return 0
+
+  # Make the bundled k3s binaries available
+  for bin in "$DIRECTORY"/data/*/bin; do
+    [ -d "$bin" ] && export PATH="$PATH:$bin:$bin/aux"
+  done
+
+  pschildren() {
+    ps -e -o ppid= -o pid= | \
+      sed -e 's/^\s*//g; s/\s\s*/\t/g;' | \
+      grep -w "^$1" | \
+      cut -f2
+  }
+
+  pstree() {
+    for pid in "$@"; do
+      echo "$pid"
+      for child in $(pschildren "$pid"); do
+        pstree "$child"
+      done
+    done
+  }
+
+  killtree() {
+    [ -z "$1" ] && return 0
+    kill -9 $(pstree "$@") 2>/dev/null
+  }
+
+  getshims() {
+    ps -e -o pid= -o args= | grep -F "$DIRECTORY/data" | grep -F containerd-shim | awk '{print $1}'
+  }
+
+  do_unmount_and_remove() {
+    while read -r _ path _; do
+      case "$path" in $1*) echo "$path" ;; esac
+    done < /proc/self/mounts | sort -r | xargs -r -n 1 sh -c 'umount -f "$0" 2>/dev/null && rm -rf "$0"'
+  }
+
+  # Kill the container shim processes
+  killtree $(getshims)
+
+  # Unmount and remove everything k3s mounted
+  do_unmount_and_remove "$DIRECTORY/data"
+  do_unmount_and_remove '/run/k3s'
+  do_unmount_and_remove "$DIRECTORY/kubelet/pods"
+  do_unmount_and_remove "$DIRECTORY/kubelet/plugins"
+  do_unmount_and_remove '/run/netns/cni-'
+
+  # Remove CNI network namespaces
+  ip netns show 2>/dev/null | grep cni- | xargs -r -n 1 ip netns delete
+
+  # Remove CNI / flannel network interfaces
+  ip link show 2>/dev/null | grep 'master cni0' | while read -r ignore iface ignore; do
+    iface=${iface%%@*}
+    [ -z "$iface" ] || ip link delete "$iface" 2>/dev/null
+  done
+  for iface in cni0 flannel.1 flannel-v6.1 kube-ipvs0 flannel-wg flannel-wg-v6; do
+    ip link delete "$iface" 2>/dev/null
+  done
+
+  rm -rf /var/lib/cni/
+
+  # Flush k3s/flannel iptables rules
+  iptables-save 2>/dev/null | grep -v KUBE- | grep -v CNI- | grep -iv flannel | iptables-restore 2>/dev/null
+  ip6tables-save 2>/dev/null | grep -v KUBE- | grep -v CNI- | grep -iv flannel | ip6tables-restore 2>/dev/null
+}
+
+stop_k3s() {
+  if is_running; then
+    local PID
+    PID=$(cat "$PID_FILE" 2>/dev/null)
+    kill "$PID" 2>/dev/null
+    sleep 2
+    kill -9 "$PID" 2>/dev/null
+    rm -f "$PID_FILE"
+    echo "k3s stopped"
+  else
+    rm -f "$PID_FILE"
+    echo "k3s is not running"
+  fi
+
+  # Clean up containers, mounts and network
+  mos_killall
+
+  # Unmount /etc/rancher
+  umount -f /etc/rancher 2>/dev/null
+}
+
+case "$1" in
+  start)
+    start_k3s
+  ;;
+
+  stop)
+    stop_k3s
+  ;;
+
+  restart)
+    stop_k3s
+    start_k3s
+  ;;
+
+  status)
+    if is_running; then
+      echo "k3s is running (PID: $(cat "$PID_FILE"))"
+      exit 0
+    else
+      echo "k3s is not running"
+      exit 1
+    fi
+  ;;
+
+  *)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 1
+  ;;
+esac

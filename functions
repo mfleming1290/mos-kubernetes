@@ -1,0 +1,42 @@
+#!/bin/bash
+
+PLG_DIR="/boot/optional/plugins/kubernetes"
+SETTINGS_FILE="$PLG_DIR/settings.json"
+
+install() {
+  /usr/bin/plugins/k3s install_binary
+}
+
+uninstall() {
+  # Stop k3s and clean up mounts and network
+  /etc/init.d/k3s stop 2>/dev/null
+
+  # Remove deployed binary and symlinks
+  rm -f /usr/bin/k3s /usr/bin/kubectl /usr/bin/crictl /usr/bin/ctr
+}
+
+mos_start() {
+  /usr/bin/plugins/k3s deploy_binary
+
+  AUTO_UPDATE=$(jq -r '.auto_update // false' "$SETTINGS_FILE" 2>/dev/null)
+  if [ "$AUTO_UPDATE" == "true" ]; then
+    # Compares the deployed binary version with the latest release and only
+    # downloads when an update is actually available (binary is already in
+    # place from deploy_binary above).
+    /usr/bin/plugins/k3s auto_update
+  fi
+}
+
+mos_start_after_services() {
+  PLG_SETTINGS=$(cat "$SETTINGS_FILE" 2>/dev/null)
+  DIRECTORY=$(echo "$PLG_SETTINGS" | jq -r '.directory // empty')
+  AUTO_START=$(echo "$PLG_SETTINGS" | jq -r '.auto_start // false')
+
+  if [ -z "$DIRECTORY" ] || [ "$DIRECTORY" = "null" ]; then
+    return 0
+  fi
+
+  if [ "$AUTO_START" == "true" ]; then
+    /etc/init.d/k3s start
+  fi
+}
