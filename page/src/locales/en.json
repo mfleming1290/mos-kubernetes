@@ -37,6 +37,11 @@
     "ok": "OK",
     "select": "Select",
     "restart_required": "Restart Required",
-    "restart_confirm_message": "The service is currently running. Saving the settings will restart the service. Do you want to continue?"
+    "restart_confirm_message": "The service is currently running. Saving the settings will restart the service. Do you want to continue?",
+    "mode": "Node Mode",
+    "mode_server": "Server / Control Plane",
+    "mode_agent": "Agent / Worker",
+    "start_args_hint_server": "Additional arguments passed to k3s server",
+    "start_args_hint_agent": "Additional arguments passed to k3s agent (for example: --server https://192.168.50.7:6443 --token K10...)"
   }
 }

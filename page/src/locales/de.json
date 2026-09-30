@@ -37,6 +37,11 @@
     "ok": "OK",
     "select": "Auswählen",
     "restart_required": "Neustart erforderlich",
-    "restart_confirm_message": "Der Dienst läuft gerade. Beim Speichern der Einstellungen wird der Dienst neu gestartet. Möchtest du fortfahren?"
+    "restart_confirm_message": "Der Dienst läuft gerade. Beim Speichern der Einstellungen wird der Dienst neu gestartet. Möchtest du fortfahren?",
+    "mode": "Knotenmodus",
+    "mode_server": "Server / Control Plane",
+    "mode_agent": "Agent / Worker",
+    "start_args_hint_server": "Zusätzliche Argumente für k3s server",
+    "start_args_hint_agent": "Zusätzliche Argumente für k3s agent (zum Beispiel: --server https://192.168.50.7:6443 --token K10...)"
   }
 }

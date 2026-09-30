@@ -11,7 +11,14 @@ This repository contains the **MOS plugin implementation**, optional helper
 functions, the SysV init script and configuration files (such as
 `settings.json`).
 
-The plugin allows MOS to make use of k3s.
+The plugin allows MOS to make use of k3s as either a control-plane/server node or an agent/worker node.
+
+### Cluster modes
+
+- **Server** starts `k3s server` and can host the control plane.
+- **Agent** starts `k3s agent` and joins an existing server by passing join flags such as `--server` and `--token` through Start Arguments.
+- Server and agent runtime state are kept separate (`data` and `agent-data`) so switching modes does not overwrite the other mode's cluster state.
+
 
 ### Binary Source
 

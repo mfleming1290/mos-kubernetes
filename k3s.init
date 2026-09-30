@@ -45,6 +45,15 @@ get_start_args() {
   echo "$START_ARGS"
 }
 
+get_mode() {
+  local MODE
+  MODE=$(jq -r '.mode // "server"' "$SETTINGS_FILE" 2>/dev/null)
+  case "$MODE" in
+    server|agent) echo "$MODE" ;;
+    *) echo "server" ;;
+  esac
+}
+
 # Function to check if k3s is running
 is_running() {
   if [ -f "$PID_FILE" ]; then
@@ -96,40 +105,54 @@ start_k3s() {
   fi
 
   START_ARGS=$(get_start_args)
+  MODE=$(get_mode)
+  if [ "$MODE" = "agent" ]; then
+    DATA_DIR="$DIRECTORY/agent-data"
+    KUBELET_DIR="$DIRECTORY/agent-kubelet"
+    RANCHER_DIR="$DIRECTORY/agent-rancher"
+  else
+    DATA_DIR="$DIRECTORY/data"
+    KUBELET_DIR="$DIRECTORY/kubelet"
+    RANCHER_DIR="$DIRECTORY/rancher"
+  fi
 
-  mkdir -p "$DIRECTORY/data"
+  mkdir -p "$DATA_DIR"
 
   # Disable pivot_root in containerd
-  CONTAINERD_DIR="$DIRECTORY/data/agent/etc/containerd/config-v3.toml.d"
+  CONTAINERD_DIR="$DATA_DIR/agent/etc/containerd/config-v3.toml.d"
   mkdir -p "$CONTAINERD_DIR"
   cat > "$CONTAINERD_DIR/10-nopivot.toml" <<'EOF'
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
   NoPivotRoot = true
 EOF
 
-  # kubelet root-dir on the system directory
-  mkdir -p "$DIRECTORY/kubelet"
+  # Keep kubelet and Rancher state separate between server and agent modes.
+  mkdir -p "$KUBELET_DIR" "$RANCHER_DIR"
 
-  # Bind-mount /etc/rancher into the system directory
-  [ ! -d "$DIRECTORY/rancher" ] && \
-    mkdir -p "$DIRECTORY/rancher"
   [ ! -d /etc/rancher ] && \
     mkdir -p /etc/rancher
   if ! findmnt /etc/rancher >/dev/null 2>&1; then
-    mount --bind "$DIRECTORY/rancher" /etc/rancher
+    mount --bind "$RANCHER_DIR" /etc/rancher
   fi
 
-  # Expose kubeconfig for the helm plugin if installed
-  if [ -d /boot/optional/plugins/helm ]; then
-    mkdir -p /root/.kube
-    ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config
-  fi
+  if [ "$MODE" = "server" ]; then
+    # Expose kubeconfig for the helm plugin if installed
+    if [ -d /boot/optional/plugins/helm ]; then
+      mkdir -p /root/.kube
+      ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config
+    fi
 
-  nohup /usr/bin/k3s server \
-    --write-kubeconfig-mode 644 \
-    --data-dir "$DIRECTORY/data" \
-    --kubelet-arg=root-dir="$DIRECTORY/kubelet" \
-    $START_ARGS > "$LOG_FILE" 2>&1 &
+    nohup /usr/bin/k3s server \
+      --write-kubeconfig-mode 644 \
+      --data-dir "$DATA_DIR" \
+      --kubelet-arg=root-dir="$KUBELET_DIR" \
+      $START_ARGS > "$LOG_FILE" 2>&1 &
+  else
+    nohup /usr/bin/k3s agent \
+      --data-dir "$DATA_DIR" \
+      --kubelet-arg=root-dir="$KUBELET_DIR" \
+      $START_ARGS > "$LOG_FILE" 2>&1 &
+  fi
   NEWPID=$!
   echo $NEWPID > "$PID_FILE"
   sleep 1
@@ -147,8 +170,17 @@ mos_killall() {
   DIRECTORY=$(get_directory)
   [ -z "$DIRECTORY" ] && return 0
 
+  MODE=$(get_mode)
+  if [ "$MODE" = "agent" ]; then
+    DATA_DIR="$DIRECTORY/agent-data"
+    KUBELET_DIR="$DIRECTORY/agent-kubelet"
+  else
+    DATA_DIR="$DIRECTORY/data"
+    KUBELET_DIR="$DIRECTORY/kubelet"
+  fi
+
   # Make the bundled k3s binaries available
-  for bin in "$DIRECTORY"/data/*/bin; do
+  for bin in "$DATA_DIR"/*/bin; do
     [ -d "$bin" ] && export PATH="$PATH:$bin:$bin/aux"
   done
 
@@ -174,7 +206,7 @@ mos_killall() {
   }
 
   getshims() {
-    ps -e -o pid= -o args= | grep -F "$DIRECTORY/data" | grep -F containerd-shim | awk '{print $1}'
+    ps -e -o pid= -o args= | grep -F "$DATA_DIR" | grep -F containerd-shim | awk '{print $1}'
   }
 
   do_unmount_and_remove() {
@@ -187,10 +219,10 @@ mos_killall() {
   killtree $(getshims)
 
   # Unmount and remove everything k3s mounted
-  do_unmount_and_remove "$DIRECTORY/data"
+  do_unmount_and_remove "$DATA_DIR"
   do_unmount_and_remove '/run/k3s'
-  do_unmount_and_remove "$DIRECTORY/kubelet/pods"
-  do_unmount_and_remove "$DIRECTORY/kubelet/plugins"
+  do_unmount_and_remove "$KUBELET_DIR/pods"
+  do_unmount_and_remove "$KUBELET_DIR/plugins"
   do_unmount_and_remove '/run/netns/cni-'
 
   # Remove CNI network namespaces

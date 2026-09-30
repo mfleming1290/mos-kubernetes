@@ -74,15 +74,24 @@
           </div>
           <template v-if="dirSaved">
             <v-divider class="my-4" />
+            <v-select
+              v-model="settings.mode"
+              :items="nodeModeOptions"
+              item-title="title"
+              item-value="value"
+              :label="$t('plugin_kubernetes.mode')"
+              :disabled="running"
+              class="mb-2"
+            />
             <v-text-field
               v-model="settings.start_args"
               :label="$t('plugin_kubernetes.start_args')"
-              :hint="running ? $t('plugin_kubernetes.start_args_locked') : $t('plugin_kubernetes.start_args_hint')"
+              :hint="running ? $t('plugin_kubernetes.start_args_locked') : (settings.mode === 'agent' ? $t('plugin_kubernetes.start_args_hint_agent') : $t('plugin_kubernetes.start_args_hint_server'))"
               persistent-hint
               :disabled="running"
             />
             <v-alert
-              v-if="!running"
+              v-if="!running && settings.mode === 'server'"
               type="warning"
               variant="tonal"
               density="compact"
@@ -258,8 +267,14 @@ const autoScrollLog = ref(true);
 
 const DEFAULT_START_ARGS = '--disable=traefik --disable=servicelb';
 
+const nodeModeOptions = [
+  { title: t('plugin_kubernetes.mode_server'), value: 'server' },
+  { title: t('plugin_kubernetes.mode_agent'), value: 'agent' },
+];
+
 const settings = reactive({
   directory: '',
+  mode: 'server',
   auto_start: false,
   auto_update: false,
   start_args: DEFAULT_START_ARGS,
@@ -271,6 +286,15 @@ const recommendedPath = ref('');
 const restartDialog = ref(false);
 const savedDirectory = ref('');
 const savedStartArgs = ref(DEFAULT_START_ARGS);
+const savedMode = ref('server');
+
+watch(() => settings.mode, (mode, previousMode) => {
+  if (mode === 'agent' && previousMode === 'server' && settings.start_args === DEFAULT_START_ARGS) {
+    settings.start_args = '';
+  } else if (mode === 'server' && previousMode === 'agent' && !settings.start_args.trim()) {
+    settings.start_args = DEFAULT_START_ARGS;
+  }
+});
 
 const getAuthHeaders = () => ({
   Authorization: 'Bearer ' + localStorage.getItem('authToken'),
@@ -365,6 +389,8 @@ const fetchSettings = async () => {
         savedDirectory.value = '';
         dirSaved.value = false;
       }
+      settings.mode = data.mode === 'agent' ? 'agent' : 'server';
+      savedMode.value = settings.mode;
       if (data.auto_start !== undefined) {
         settings.auto_start = data.auto_start;
       }
@@ -414,6 +440,7 @@ const saveSettings = async (restart = false) => {
       },
       body: JSON.stringify({
         directory: settings.directory,
+        mode: settings.mode,
         auto_start: settings.auto_start,
         auto_update: settings.auto_update,
         start_args: settings.start_args,
@@ -424,6 +451,7 @@ const saveSettings = async (restart = false) => {
     recommendedPath.value = '';
     savedDirectory.value = settings.directory;
     savedStartArgs.value = settings.start_args;
+    savedMode.value = settings.mode;
 
     if (restart && running.value) {
       await queryK3s(['restart'], 60);
@@ -438,7 +466,9 @@ const saveSettings = async (restart = false) => {
 
 const confirmSaveSettings = () => {
   const restartNeeded = running.value &&
-    (settings.directory !== savedDirectory.value || settings.start_args !== savedStartArgs.value);
+    (settings.directory !== savedDirectory.value ||
+     settings.start_args !== savedStartArgs.value ||
+     settings.mode !== savedMode.value);
 
   if (restartNeeded) {
     restartDialog.value = true;
